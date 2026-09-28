@@ -1,0 +1,17 @@
+# CDC app (embedded Debezium engine + consumer), joined to the existing
+# saga-axon-kafka network (Kafka: kafka:29092, Postgres: postgres:5432).
+services:
+  # Build the jar first: ./mvnw package -DskipTests
+  cdc-app:
+    build: .
+    container_name: cdc-app
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      DB_HOST: postgres
+    networks:
+      - saga
+
+networks:
+  saga:
+    name: saga-axon-kafka_default
+    external: true

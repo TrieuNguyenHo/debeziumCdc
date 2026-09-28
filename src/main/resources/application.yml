@@ -1,0 +1,50 @@
+spring:
+  application:
+    name: CDC
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9192}
+    consumer:
+      group-id: cdc-app
+      auto-offset-reset: earliest
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.ByteArraySerializer
+      value-serializer: org.apache.kafka.common.serialization.ByteArraySerializer
+
+cdc:
+  topics:
+    # Topic = <topic.prefix>.<schema>.<table>
+    order: cdc.order.public.order_entity
+
+  # Debezium embedded engine properties, passed as-is to the engine.
+  debezium:
+    name: order-db-cdc
+    connector.class: io.debezium.connector.postgresql.PostgresConnector
+    database.hostname: ${DB_HOST:localhost}
+    database.port: ${DB_PORT:5432}
+    database.user: ${DB_USER:saga}
+    database.password: ${DB_PASSWORD:saga}
+    database.dbname: order_db
+    topic.prefix: cdc.order
+    table.include.list: public.order_entity
+    plugin.name: pgoutput
+    slot.name: cdc_order_slot
+    publication.name: cdc_order_publication
+    publication.autocreate.mode: filtered
+    snapshot.mode: initial
+    decimal.handling.mode: string
+
+    # Offsets stored in a Kafka topic, so restarts resume from the last committed LSN.
+    offset.storage: org.apache.kafka.connect.storage.KafkaOffsetBackingStore
+    offset.storage.topic: cdc-app.debezium-offsets
+    offset.storage.partitions: 1
+    offset.storage.replication.factor: 1
+    offset.flush.interval.ms: 5000
+    bootstrap.servers: ${spring.kafka.bootstrap-servers}
+
+    # Plain JSON (no schema envelope), row state flattened.
+    key.converter.schemas.enable: false
+    value.converter.schemas.enable: false
+    transforms: unwrap
+    transforms.unwrap.type: io.debezium.transforms.ExtractNewRecordState
+    transforms.unwrap.add.fields: op,table,source.ts_ms
+    transforms.unwrap.delete.tombstone.handling.mode: rewrite
