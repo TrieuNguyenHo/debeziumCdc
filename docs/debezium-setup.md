@@ -202,6 +202,7 @@ Các cấu hình chính trong `cdc.debezium`:
 | `publication.autocreate.mode` | `filtered` | Publication chỉ chứa bảng trong `table.include.list` |
 | `topic.prefix` | `cdc.order` | Destination = `cdc.order.public.order_entity` (dùng làm topic Kafka) |
 | `snapshot.mode` | `initial` | Snapshot 1 lần khi chưa có offset |
+| `offset.mismatch.strategy` | `trust_slot` | Offset tụt sau slot thì stream từ slot thay vì fail (Issue 6) |
 | `decimal.handling.mode` | `string` | `numeric` ra `"99.50"` thay vì bytes base64 |
 | `heartbeat.interval.ms` / `heartbeat.action.query` | `10000` / upsert `debezium_heartbeat` | Giữ slot luôn tiến lên (Bước 3) |
 | `offset.storage` | `KafkaOffsetBackingStore` | Offset lưu ở topic `cdc-app.debezium-offsets`, cần thêm `bootstrap.servers` |
@@ -286,9 +287,11 @@ và `Retrieved latest position from stored offset`.
   ```
 - **Nguyên nhân:** Kafka saga advertise `PLAINTEXT_HOST://localhost:9092` nhưng map port ra host là `9192->9092`.
   Bootstrap qua `localhost:9192` được, nhưng broker trả về `localhost:9092` — trên host không có gì lắng nghe.
-- **Giải quyết (đang dùng):** chạy app trong Docker cùng network, kết nối `kafka:29092` (service `cdc-app`).
-- **Cách khác (chạy từ IDE):** sửa compose saga thành
-  `KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9192` rồi recreate Kafka.
+- **Giải quyết:**
+  - Trong Docker: chạy cùng network, kết nối `kafka:29092` (service `cdc-app`).
+  - Từ IDE (**đã áp dụng** 2026-09-29): sửa compose saga thành
+    `KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9192` rồi `docker compose up -d kafka`.
+    Service trong Docker vẫn dùng `kafka:29092` nên không ảnh hưởng.
 - **Ảnh hưởng tới test:** `CdcApplicationTests.contextLoads` khởi động engine thật trỏ vào `localhost` nên chạy
   ~45s (engine không tới được Kafka), nhưng vẫn pass.
 
@@ -297,6 +300,29 @@ và `Retrieved latest position from stored offset`.
 - **Triệu chứng:** Message DELETE có các cột khác `null`, `quantity = 0`, chỉ còn `order_id`.
 - **Nguyên nhân:** `REPLICA IDENTITY DEFAULT` → WAL chỉ ghi giá trị cũ của cột PK.
 - **Giải quyết (chưa áp dụng, tuỳ nhu cầu):** `ALTER TABLE order_entity REPLICA IDENTITY FULL;` (WAL lớn hơn).
+
+### Issue 6 — Engine chết khi start: offset tụt sau replication slot
+
+- **Triệu chứng:** App start bình thường nhưng heartbeat không chạy, update `order_entity` không ra event.
+  Slot `active = f`, không có dòng nào trong `pg_stat_replication`, thread dump không có thread engine. Log (lẫn giữa
+  log config Kafka):
+  ```
+  ERROR AsyncEmbeddedEngine : 1 task(s) out of 1 failed to start.
+  DebeziumException: The connector is trying to read change stream starting at PostgresOffsetContext [...
+    lsn=LSN{0/10EA3B30}, lastCommitLsn=LSN{0/10EA3AF8}, timestamp=2026-09-28T09:31:59Z ...],
+    but this is no longer available on the server.
+  ```
+- **Nguyên nhân:** offset lưu trong Kafka (`lsn_commit = 0/10EA3AF8`) **nhỏ hơn** `confirmed_flush_lsn` của slot
+  (`0/10EA3BB8`, khớp lần heartbeat cuối 09:32:20). Postgres không trả lại WAL trước `confirmed_flush_lsn`, và với
+  strategy mặc định `no_validation` engine dừng hẳn. Chưa xác định được vì sao bản ghi offset cuối không lên
+  Kafka (nghi app/Kafka dừng giữa lúc flush).
+- **Đã thử:** `trust_greater_lsn` — vẫn `pg_replication_slot_advance` về LSN của offset, Postgres từ chối
+  `cannot advance replication slot to 0/10EA3AF8, minimum is 0/10EA3BB8`, engine retry mỗi 10s.
+- **Giải quyết:** `offset.mismatch.strategy: trust_slot` → log `Received COMMIT LSN 'LSN{0/10EA3CB0}' larger than
+  than last stored commit LSN` → `Processing messages`, heartbeat và CDC chạy lại.
+- **Mất dữ liệu?** Khoảng WAL giữa offset và slot (192 byte) bị bỏ qua. Slot chỉ tiến khi Debezium flush, nên
+  khoảng này đã được engine xử lý trước đó — nhiều khả năng chỉ là heartbeat, không kiểm chứng được.
+- Quy trình đối chiếu chi tiết: xem [Đối chiếu offset với replication slot](#đối-chiếu-offset-với-replication-slot).
 
 ### Chuyển từ Kafka Connect sang Spring Integration Debezium
 
@@ -336,6 +362,78 @@ docker exec saga-axon-kafka-postgres-1 psql -U saga -d order_db -c \
 docker exec saga-axon-kafka-kafka-1 kafka-console-consumer --bootstrap-server kafka:29092 \
   --topic cdc-app.debezium-offsets --from-beginning --property print.key=true --timeout-ms 10000
 ```
+
+### Đối chiếu offset với replication slot
+
+Vị trí đọc WAL được lưu ở **2 nơi** độc lập:
+
+| Nơi lưu | Giá trị | Định dạng |
+|---|---|---|
+| Kafka topic `cdc-app.debezium-offsets`, key `["order-db-cdc",{"server":"cdc.order"}]` | `lsn_commit` (commit LSN của transaction cuối đã xử lý), `lsn` / `lsn_proc` (LSN event cuối), `txId`, `ts_usec` | Số thập phân |
+| Postgres `pg_replication_slots` | `confirmed_flush_lsn` (Postgres không gửi lại WAL trước mốc này), `restart_lsn` (WAL cũ nhất còn giữ) | `X/Y` hex |
+
+**Vòng đời khi đang chạy:** xử lý event → mỗi `offset.flush.interval.ms` (5s) ghi offset lên Kafka → commit →
+Debezium flush `lsn_commit` về slot → `confirmed_flush_lsn` tiến lên → Postgres dọn WAL cũ.
+Vì slot chỉ được flush **sau** khi offset đã ghi, trạng thái bình thường là
+**`confirmed_flush_lsn` = `lsn_commit`** (đã kiểm chứng) hoặc slot tụt sau offset một chút.
+
+**Khi engine start, chọn vị trí đọc WAL tiếp theo:**
+
+1. Đọc bản ghi offset **mới nhất** theo key từ topic offset. Không có offset → snapshot theo `snapshot.mode`.
+2. Đọc trạng thái slot, so sánh với offset theo `offset.mismatch.strategy` (log `Using offset mismatch strategy ...`).
+   Offset không còn đọc được từ slot → fail `... but this is no longer available on the server`.
+3. Nếu strategy yêu cầu thì seek slot: `SELECT pg_replication_slot_advance('cdc_order_slot', '<lsn_commit>')`
+   (log `Seeking to LSN{...} on the replication slot`). Slot chỉ tiến được, **không lùi được**.
+4. `START_REPLICATION` trên slot: Postgres stream từ `confirmed_flush_lsn`.
+5. `WalPositionLocator` bỏ qua các message đã xử lý (≤ offset đã lưu), tới khi gặp
+   `Received COMMIT LSN '...' larger than than last stored commit LSN '...'` → `Processing messages`.
+
+**Lệnh đối chiếu:**
+
+```sh
+# 1. Slot: LSN hex + dạng số để so với Kafka
+docker exec saga-axon-kafka-postgres-1 psql -U saga -d order_db -c \
+  "select slot_name, active, confirmed_flush_lsn, confirmed_flush_lsn - '0/0'::pg_lsn as confirmed_dec, restart_lsn
+   from pg_replication_slots where slot_name = 'cdc_order_slot'"
+
+# 2. Offset mới nhất trong Kafka (dòng cuối)
+docker exec saga-axon-kafka-kafka-1 kafka-console-consumer --bootstrap-server kafka:29092 \
+  --topic cdc-app.debezium-offsets --from-beginning --property print.key=true --timeout-ms 8000 | tail -1
+# ["order-db-cdc",{"server":"cdc.order"}]  {"lsn_proc":283853840,"lsn_commit":283853728,"lsn":283853840,"txId":313797,...}
+
+# 3. Đổi số thập phân của Kafka sang hex để đọc log / so với slot
+docker exec saga-axon-kafka-postgres-1 psql -U saga -d order_db -tAc "select '0/0'::pg_lsn + 283853728"
+# 0/10EB43A0   (hex → số: select '0/10EB43A0'::pg_lsn - '0/0'::pg_lsn)
+```
+
+**Đọc kết quả** (so `lsn_commit` với `confirmed_dec`):
+
+| Tình huống | Ý nghĩa | Hành động |
+|---|---|---|
+| Bằng nhau | Bình thường | — |
+| Offset > slot | Slot flush chậm hơn offset (vd. app dừng ngay sau khi ghi offset) | Bình thường. Postgres còn giữ WAL, engine lọc phần đã xử lý |
+| Offset < slot | Offset mất bản ghi cuối, topic offset bị restore bản cũ, hoặc slot bị advance từ bên ngoài | Cần `trust_slot` (Issue 6). Kiểm tra khoảng WAL bị bỏ qua |
+| Slot `restart_lsn` mới hơn offset rất nhiều, slot mới được tạo | Slot bị drop/tạo lại → mất thay đổi ở giữa | Snapshot lại (mục dưới). Dùng `trust_offset` để phát hiện sớm |
+| Không có slot | Slot bị drop | Engine tự tạo slot mới tại vị trí hiện tại → mất thay đổi ở giữa. Snapshot lại |
+
+### Offset mismatch strategy
+
+Property `offset.mismatch.strategy` (Debezium Postgres 3.5.2). Mô tả lấy từ log của connector, kèm kết quả đã thử:
+
+| Giá trị | Hành vi | Đã thử |
+|---|---|---|
+| `no_validation` (mặc định) | Không so sánh với slot, stream từ offset đã lưu. Không phát hiện slot bị tạo lại | Offset < slot → **fail**, engine dừng |
+| `trust_offset` | Offset đi trước → advance slot tới offset. Slot đi trước → **fail** (để phát hiện slot bị tạo lại) | Chưa thử |
+| `trust_slot` | Slot là chuẩn. Slot đi trước → nâng offset lên theo slot | Offset < slot → **chạy được** (đang dùng) |
+| `trust_greater_lsn` | Mô tả: đồng bộ về `max(offset_lsn, slot_lsn)`, tự hồi phục theo cả 2 chiều | Offset < slot → vẫn seek slot lùi về offset, Postgres từ chối, **retry mãi** |
+
+**Lựa chọn:**
+- `trust_slot` (đang dùng): ưu tiên pipeline tự chạy lại. Đánh đổi: nếu slot bị drop/tạo lại thì tiến trình
+  **âm thầm** bỏ qua khoảng dữ liệu bị mất. Nên giám sát slot (lệnh ở trên) và alert khi slot bị tạo lại.
+- `trust_offset`: ưu tiên phát hiện mất dữ liệu. Offset < slot thì fail, cần người xử lý (snapshot lại hoặc tạm chuyển
+  `trust_slot`).
+- Chưa kiểm chứng: với `trust_slot`, khi offset > slot, engine lấy vị trí nào (có phát lại event trùng không).
+  Consumer vẫn cần idempotent theo `order_id` (at-least-once).
 
 ### Snapshot lại từ đầu
 

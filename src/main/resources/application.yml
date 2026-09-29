@@ -31,6 +31,9 @@ cdc:
     publication.name: cdc_order_publication
     publication.autocreate.mode: filtered
     snapshot.mode: initial
+    # Stored offset can lag the slot's confirmed LSN; without this the engine fails on start with
+    # "no longer available on the server". Stream from the slot position instead.
+    offset.mismatch.strategy: trust_slot
     decimal.handling.mode: string
 
     # Keep the slot advancing when order_entity is idle but other tables fill the WAL.
