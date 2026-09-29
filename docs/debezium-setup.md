@@ -92,14 +92,15 @@ docker exec saga-axon-kafka-postgres-1 psql -U saga -d order_db \
   -c "select slot_name, plugin, active from pg_replication_slots"
 ```
 
-Kết quả mong đợi: `cdc_order_publication` chứa đúng `public.order_entity`, slot `cdc_order_slot` (plugin `pgoutput`)
+Kết quả mong đợi: `cdc_order_publication` chứa đúng `public.order_entity` và `public.debezium_heartbeat`
+(xem Bước 3), slot `cdc_order_slot` (plugin `pgoutput`)
 ở trạng thái `active = t`.
 
 **Tạo publication thủ công** (khi user của Debezium không được phép tạo, ví dụ môi trường production do DBA quản lý):
 
 ```sql
 -- chạy bằng user sở hữu bảng (hoặc superuser), trong database order_db
-CREATE PUBLICATION cdc_order_publication FOR TABLE public.order_entity;
+CREATE PUBLICATION cdc_order_publication FOR TABLE public.order_entity, public.debezium_heartbeat;
 ```
 
 rồi đổi `cdc.debezium.publication.autocreate.mode` thành `disabled`.
@@ -109,7 +110,68 @@ Lưu ý: `CREATE PUBLICATION ... FOR TABLE` yêu cầu quyền `CREATE` trên da
 Khi thêm bảng vào CDC: với `filtered` chỉ cần sửa `table.include.list` rồi restart app;
 với `disabled` phải chạy tay `ALTER PUBLICATION cdc_order_publication ADD TABLE <bảng>;`.
 
-### 3. Build & chạy app
+### 3. Bảng heartbeat (chống WAL phình to)
+
+**Vấn đề:** slot chỉ tiến lên khi connector xác nhận (flush) một LSN mới, mà connector chỉ nhận được message
+của các bảng trong publication. Nếu `order_entity` ít thay đổi trong khi các bảng khác (Axon `domain_event_entry`,
+`token_entry`…) ghi liên tục, slot đứng yên và **giữ toàn bộ WAL** → đầy disk
+(xem [production-risks.md mục 1](production-risks.md#1-wal-phình-to-đầy-disk)).
+
+**Giải pháp:** cứ mỗi `heartbeat.interval.ms`, Debezium chạy `heartbeat.action.query` để ghi vào bảng
+`debezium_heartbeat`. Bảng này nằm trong publication nên thay đổi đi qua slot, connector nhận được, commit offset
+và xác nhận LSN mới nhất cho Postgres, nhờ đó WAL cũ được giải phóng.
+
+Tạo bảng **trước khi** start app. Debezium không tự tạo bảng, và engine sẽ lỗi khi đưa một bảng chưa tồn tại
+vào publication:
+
+```sh
+docker exec -i saga-axon-kafka-postgres-1 psql -U saga -d order_db < sql/debezium_heartbeat.sql
+```
+
+Cấu hình trong `application.yml`:
+
+```yaml
+table.include.list: public.order_entity,public.debezium_heartbeat
+heartbeat.interval.ms: 10000
+heartbeat.action.query: >-
+  INSERT INTO public.debezium_heartbeat (id, ts) VALUES (1, now())
+  ON CONFLICT (id) DO UPDATE SET ts = EXCLUDED.ts
+```
+
+Bảng chỉ có 1 dòng (`id = 1`), được upsert liên tục nên không phình to.
+
+**Không publish lên Kafka:** heartbeat sinh ra 2 loại message, flow `debeziumToKafkaFlow` lọc bỏ cả hai
+(chỉ forward destination `cdc.order.public.order_entity`, phần còn lại đi vào `nullChannel`):
+
+| Destination | Nguồn gốc |
+|---|---|
+| `__debezium-heartbeat.cdc.order` | Heartbeat record của Debezium (mang offset hiện tại) |
+| `cdc.order.public.debezium_heartbeat` | Change event của bảng heartbeat |
+
+Hai topic này không được tạo trên Kafka; nếu không lọc, `send().join()` sẽ treo vì broker tắt auto-create.
+Engine vẫn coi các message bị lọc là đã xử lý, nên offset vẫn được commit.
+
+**Kết quả đo** (ghi ~61 MB WAL vào một bảng không được capture trong `order_db`):
+
+| | Trước heartbeat | Sau heartbeat |
+|---|---|---|
+| Lag ngay sau khi ghi | 61 MB | 61 MB |
+| Lag sau 30s | 61 MB (đứng yên) | ~400 kB |
+| Lag sau 60s | 61 MB (đứng yên) | ~400 bytes |
+
+Thời gian hồi phục ≈ `heartbeat.interval.ms` (10s) + `offset.flush.interval.ms` (5s) + thời gian Postgres decode
+lượng WAL tồn đọng.
+
+Kiểm tra heartbeat đang chạy (`ts` phải cập nhật mỗi ~10s):
+
+```sh
+docker exec saga-axon-kafka-postgres-1 psql -U saga -d order_db -c "select ts, now() from debezium_heartbeat"
+```
+
+> Heartbeat chỉ xử lý trường hợp **connector đang chạy**. Nếu app dừng hoặc slot mồ côi, WAL vẫn bị giữ;
+> cần giám sát lag (xem phần Vận hành) và cân nhắc `max_slot_wal_keep_size`.
+
+### 4. Build & chạy app
 
 ```sh
 ./mvnw package -DskipTests
@@ -141,6 +203,7 @@ Các cấu hình chính trong `cdc.debezium`:
 | `topic.prefix` | `cdc.order` | Destination = `cdc.order.public.order_entity` (dùng làm topic Kafka) |
 | `snapshot.mode` | `initial` | Snapshot 1 lần khi chưa có offset |
 | `decimal.handling.mode` | `string` | `numeric` ra `"99.50"` thay vì bytes base64 |
+| `heartbeat.interval.ms` / `heartbeat.action.query` | `10000` / upsert `debezium_heartbeat` | Giữ slot luôn tiến lên (Bước 3) |
 | `offset.storage` | `KafkaOffsetBackingStore` | Offset lưu ở topic `cdc-app.debezium-offsets`, cần thêm `bootstrap.servers` |
 | `key/value.converter.schemas.enable` | `false` | JSON thuần, không có envelope schema |
 | `transforms.unwrap` | `ExtractNewRecordState` | Làm phẳng message, thêm `__op`, `__table`, `__source_ts_ms` |
@@ -149,7 +212,7 @@ Các cấu hình chính trong `cdc.debezium`:
 **Delivery semantics:** flow gọi `kafkaTemplate.send(...).join()` — engine chỉ commit offset sau khi Kafka ack
 → **at-least-once** (có thể trùng khi app crash giữa chừng, không mất). Consumer nên xử lý idempotent theo `order_id`.
 
-### 4. Kiểm tra end-to-end
+### 5. Kiểm tra end-to-end
 
 ```sh
 docker exec saga-axon-kafka-postgres-1 psql -U saga -d order_db \
@@ -293,6 +356,7 @@ docker compose start cdc-app
 docker compose down
 docker exec saga-axon-kafka-postgres-1 psql -U saga -d order_db \
   -c "select pg_drop_replication_slot('cdc_order_slot')" \
-  -c "drop publication if exists cdc_order_publication"
+  -c "drop publication if exists cdc_order_publication" \
+  -c "drop table if exists debezium_heartbeat"
 docker exec saga-axon-kafka-kafka-1 kafka-topics --bootstrap-server kafka:29092 --delete --topic cdc-app.debezium-offsets
 ```

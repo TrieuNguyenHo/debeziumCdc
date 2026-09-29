@@ -10,6 +10,7 @@ import org.springframework.integration.debezium.support.DebeziumHeaders;
 import org.springframework.integration.dsl.IntegrationFlow;
 import org.springframework.kafka.config.TopicBuilder;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.messaging.Message;
 
 /**
  * Runs the Debezium Postgres connector embedded in this app (no Kafka Connect)
@@ -20,8 +21,14 @@ import org.springframework.kafka.core.KafkaTemplate;
 public class DebeziumConfig {
 
     @Bean
-    IntegrationFlow debeziumToKafkaFlow(CdcProperties cdcProperties, KafkaTemplate<byte[], byte[]> kafkaTemplate) {
+    IntegrationFlow debeziumToKafkaFlow(CdcProperties cdcProperties, KafkaTemplate<byte[], byte[]> kafkaTemplate,
+                                        @Value("${cdc.topics.order}") String orderTopic) {
         return IntegrationFlow.from(Debezium.inboundChannelAdapter(cdcProperties.debeziumProperties()))
+                // Drop heartbeat records and debezium_heartbeat table changes: they only exist to advance
+                // the replication slot, and their topics are not created (auto.create.topics.enable=false).
+                .filter(Message.class,
+                        message -> orderTopic.equals(message.getHeaders().get(DebeziumHeaders.DESTINATION)),
+                        filter -> filter.discardChannel("nullChannel"))
                 .handle(message -> {
                     String topic = message.getHeaders().get(DebeziumHeaders.DESTINATION, String.class);
                     byte[] key = message.getHeaders().get(DebeziumHeaders.KEY, byte[].class);
