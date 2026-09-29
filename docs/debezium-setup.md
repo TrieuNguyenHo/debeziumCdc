@@ -416,6 +416,73 @@ docker exec saga-axon-kafka-postgres-1 psql -U saga -d order_db -tAc "select '0/
 | Slot `restart_lsn` mới hơn offset rất nhiều, slot mới được tạo | Slot bị drop/tạo lại → mất thay đổi ở giữa | Snapshot lại (mục dưới). Dùng `trust_offset` để phát hiện sớm |
 | Không có slot | Slot bị drop | Engine tự tạo slot mới tại vị trí hiện tại → mất thay đổi ở giữa. Snapshot lại |
 
+### Restart khi offset đi trước slot
+
+Ví dụ: offset `lsn_commit = 1000`, slot `confirmed_flush_lsn = 999`.
+
+**Vì sao xảy ra:** offset = "đã giao xong", slot luôn đi sau offset một nhịp:
+1. Handler chạy `kafkaTemplate.send(...).join()`, block tới khi Kafka ack.
+2. Handler return → engine đánh dấu record đã xử lý → ghi offset lên Kafka (mỗi 5s).
+3. Sau đó thread `lsn-flush` mới flush `lsn_commit` về slot.
+
+App dừng giữa bước 2 và 3 → offset 1000, slot 999.
+
+**Khi restart:**
+- Postgres gửi lại từ 999, gồm cả txn 1000.
+- Debezium đọc, decode rồi **bỏ** txn 1000 (LSN ≤ offset): không gửi Kafka, không ghi bản ghi offset, không flush slot.
+  Slot **vẫn 999**. Keepalive cũng báo 999, vì flush mode `connector` tắt keepalive flush của driver.
+- Filter chỉ chạy lúc khởi động. Gặp txn đầu tiên chưa xử lý → `switching off the filtering` → xử lý bình thường.
+  Crash giữa txn thì resume theo `lsn` (event cuối), chạy tiếp từ event kế trong txn đó.
+- An toàn vì logical decoding gửi txn theo **thứ tự commit** → commit LSN tăng dần → LSN ≤ offset chắc chắn đã xử lý.
+
+**Slot chỉ tiến khi có txn mới được xử lý** (heartbeat ≤10s hoặc thay đổi bảng order): record qua flow → offset ghi
+ở lần flush kế (5s) → flush về slot → `confirmed_flush_lsn` = `lsn_commit` offset mới nhất. Tức là khoảng 10–15s
+sau restart là bằng nhau.
+- Slot **nhảy thẳng qua** 1000 lên LSN của txn mới, không dừng ở 1000.
+- "Bằng nhau" là trạng thái nghỉ. Giữa lúc ghi offset và flush slot, offset luôn đi trước một chút — bình thường.
+- Không có heartbeat và bảng order không đổi → slot đứng ở 999 mãi (chỉ giữ thêm ít WAL). Heartbeat chỉ chạy khi app chạy.
+
+**Kiểm chứng (2026-09-29, `trust_slot`):**
+
+| | Trước restart | Sau restart ~90s |
+|---|---|---|
+| Slot `confirmed_flush_lsn` | `0/10EB6678` | `0/10EB9708` (= `lsn_commit` offset mới nhất) |
+| Offset `lsn_commit` | `0/10EB7428` = COMMIT txn `313809` (UPDATE `order_entity`, đã publish) | `0/10EB9708` |
+| Bản ghi topic offset | 1287 | 1295 (toàn bộ là heartbeat mới) |
+| End offset topic order | 32 | 32 → **không trùng** |
+
+Log:
+```
+Looking for WAL restart position for last commit LSN 'LSN{0/10EB7428}' ...
+found previous flushed LSN 'LSN{0/10EB6678}'
+Received COMMIT LSN 'LSN{0/10EB7D88}' larger than than last stored commit LSN 'LSN{0/10EB7428}'
+Will restart from LSN 'LSN{0/10EB7D00}' that is start of the first unprocessed transaction
+Message with LSN 'LSN{0/10EB7D00}' arrived, switching off the filtering
+```
+
+Xem các txn trong khoảng slot → hiện tại (không làm slot tiến, chỉ chạy khi slot **không** active):
+
+```sh
+docker exec saga-axon-kafka-postgres-1 psql -U saga -d order_db -c "
+select lsn, lsn - '0/0'::pg_lsn as lsn_dec, xid, chr(get_byte(data,0)) as msg,  -- B/R/I/U/D/C
+       case when get_byte(data,0) = ascii('R') then encode(substring(data from 6 for 40),'escape') end as rel
+from pg_logical_slot_peek_binary_changes('cdc_order_slot', NULL, NULL,
+       'proto_version','1','publication_names','cdc_order_publication')"
+```
+
+### Khi nào event bị bỏ qua vĩnh viễn
+
+Việc lọc chỉ an toàn khi offset đúng. Event mất hẳn khi offset ghi nhận "đã xử lý" một event chưa thực sự tới đích:
+
+| Rủi ro | Chi tiết | Phòng tránh |
+|---|---|---|
+| Flow bỏ event nhưng vẫn commit offset | Filter trong `DebeziumConfig` đẩy mọi destination khác topic order vào `nullChannel`. Thêm bảng vào `table.include.list` mà quên sửa filter → event bảng đó mất im lặng | Thêm bảng thì sửa filter + `NewTopic`. Cân nhắc chỉ bỏ destination heartbeat, fail với destination lạ |
+| Exception bị nuốt | Hiện tại adapter không có `errorChannel` → exception từ `send().join()` đi ngược lên engine, record không bị đánh dấu xử lý (đã decompile Spring Integration 7.1.1 `MessageProducerSupport.sendMessage`). Thêm `.errorChannel(...)`, try/catch quanh `send()`, bỏ `.join()` hoặc chèn executor channel → mất event khi Kafka lỗi | Giữ flow đồng bộ, không nuốt exception |
+| DB đổi "vũ trụ LSN" (restore backup, PITR, cluster mới) | LSN mới thấp hơn offset cũ → mọi thay đổi tới khi vượt mốc offset bị lọc, không báo lỗi. Không strategy nào cứu được (`trust_offset` còn advance slot lên theo offset). *Suy ra từ cơ chế lọc, chưa test* | Restore/đổi DB → reset offset + snapshot lại (mục dưới). Promote physical standby thì LSN nối tiếp, OK (cần failover slot PG17) |
+| Kafka mất message đã ack | Topic data và offset đều replication factor 1 → mất disk broker là mất cả hai | Production: RF ≥ 3 |
+
+Ngoài ra engine có thể chết trong khi app vẫn chạy (Issue 6) → giám sát `pg_replication_slots.active`.
+
 ### Offset mismatch strategy
 
 Property `offset.mismatch.strategy` (Debezium Postgres 3.5.2). Mô tả lấy từ log của connector, kèm kết quả đã thử:
@@ -432,8 +499,8 @@ Property `offset.mismatch.strategy` (Debezium Postgres 3.5.2). Mô tả lấy t�
   **âm thầm** bỏ qua khoảng dữ liệu bị mất. Nên giám sát slot (lệnh ở trên) và alert khi slot bị tạo lại.
 - `trust_offset`: ưu tiên phát hiện mất dữ liệu. Offset < slot thì fail, cần người xử lý (snapshot lại hoặc tạm chuyển
   `trust_slot`).
-- Chưa kiểm chứng: với `trust_slot`, khi offset > slot, engine lấy vị trí nào (có phát lại event trùng không).
-  Consumer vẫn cần idempotent theo `order_id` (at-least-once).
+- `trust_slot` khi offset > slot: không phát lại event đã xử lý (xem [Restart khi offset đi trước slot](#restart-khi-offset-đi-trước-slot)).
+- Consumer vẫn cần idempotent theo `order_id` (at-least-once khi app crash giữa lúc gửi Kafka và ghi offset).
 
 ### Snapshot lại từ đầu
 
