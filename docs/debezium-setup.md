@@ -497,6 +497,7 @@ Property `offset.mismatch.strategy` (Debezium Postgres 3.5.2). Mô tả lấy t�
 **Lựa chọn:**
 - `trust_slot` (đang dùng): ưu tiên pipeline tự chạy lại. Đánh đổi: nếu slot bị drop/tạo lại thì tiến trình
   **âm thầm** bỏ qua khoảng dữ liệu bị mất. Nên giám sát slot (lệnh ở trên) và alert khi slot bị tạo lại.
+  Kịch bản test: [Replication slot bị xoá](test-scenarios.md#replication-slot-bị-xoá).
 - `trust_offset`: ưu tiên phát hiện mất dữ liệu. Offset < slot thì fail, cần người xử lý (snapshot lại hoặc tạm chuyển
   `trust_slot`).
 - `trust_slot` khi offset > slot: không phát lại event đã xử lý (xem [Restart khi offset đi trước slot](#restart-khi-offset-đi-trước-slot)).
