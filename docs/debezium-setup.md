@@ -414,7 +414,7 @@ docker exec saga-axon-kafka-postgres-1 psql -U saga -d order_db -tAc "select '0/
 | Offset > slot | Slot flush chậm hơn offset (vd. app dừng ngay sau khi ghi offset) | Bình thường. Postgres còn giữ WAL, engine lọc phần đã xử lý |
 | Offset < slot | Offset mất bản ghi cuối, topic offset bị restore bản cũ, hoặc slot bị advance từ bên ngoài | Cần `trust_slot` (Issue 6). Kiểm tra khoảng WAL bị bỏ qua |
 | Slot `restart_lsn` mới hơn offset rất nhiều, slot mới được tạo | Slot bị drop/tạo lại → mất thay đổi ở giữa | Snapshot lại (mục dưới). Dùng `trust_offset` để phát hiện sớm |
-| Không có slot | Slot bị drop | Engine tự tạo slot mới tại vị trí hiện tại → mất thay đổi ở giữa. Snapshot lại |
+| Không có slot | Slot bị drop | Engine tự tạo slot mới tại vị trí hiện tại → mất thay đổi ở giữa, không báo lỗi (đã kiểm chứng, xem [test](test-scenarios.md#replication-slot-bị-xoá)). Snapshot lại |
 
 ### Restart khi offset đi trước slot
 
