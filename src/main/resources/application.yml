@@ -38,10 +38,10 @@ cdc:
 
     # Keep the slot advancing when order_entity is idle but other tables fill the WAL.
     # Table is created by sql/debezium_heartbeat.sql; its events are not published to Kafka.
-    heartbeat.interval.ms: 10000
-    heartbeat.action.query: >-
-      INSERT INTO public.debezium_heartbeat (id, ts) VALUES (1, now())
-      ON CONFLICT (id) DO UPDATE SET ts = EXCLUDED.ts
+    #heartbeat.interval.ms: 10000
+    #heartbeat.action.query: >-
+     # INSERT INTO public.debezium_heartbeat (id, ts) VALUES (1, now())
+      #ON CONFLICT (id) DO UPDATE SET ts = EXCLUDED.ts
 
     # Offsets stored in a Kafka topic, so restarts resume from the last committed LSN.
     offset.storage: org.apache.kafka.connect.storage.KafkaOffsetBackingStore
