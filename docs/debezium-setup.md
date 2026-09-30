@@ -369,7 +369,7 @@ Vị trí đọc WAL được lưu ở **2 nơi** độc lập:
 
 | Nơi lưu | Giá trị | Định dạng |
 |---|---|---|
-| Kafka topic `cdc-app.debezium-offsets`, key `["order-db-cdc",{"server":"cdc.order"}]` | `lsn_commit` (commit LSN của transaction cuối đã xử lý), `lsn` / `lsn_proc` (LSN event cuối), `txId`, `ts_usec` | Số thập phân |
+| Kafka topic `cdc-app.debezium-offsets`, key `["order-db-cdc",{"server":"cdc.order"}]` | `lsn_commit` (commit LSN gần nhất **đã lưu**, trễ 1 txn, xem [lsn_commit trễ một transaction](#lsn_commit-trễ-một-transaction)), `lsn` / `lsn_proc` (LSN event cuối), `txId`, `ts_usec` | Số thập phân |
 | Postgres `pg_replication_slots` | `confirmed_flush_lsn` (Postgres không gửi lại WAL trước mốc này), `restart_lsn` (WAL cũ nhất còn giữ) | `X/Y` hex |
 
 **Vòng đời khi đang chạy:** xử lý event → mỗi `offset.flush.interval.ms` (5s) ghi offset lên Kafka → commit →
@@ -415,6 +415,53 @@ docker exec saga-axon-kafka-postgres-1 psql -U saga -d order_db -tAc "select '0/
 | Offset < slot | Offset mất bản ghi cuối, topic offset bị restore bản cũ, hoặc slot bị advance từ bên ngoài | Cần `trust_slot` (Issue 6). Kiểm tra khoảng WAL bị bỏ qua |
 | Slot `restart_lsn` mới hơn offset rất nhiều, slot mới được tạo | Slot bị drop/tạo lại → mất thay đổi ở giữa | Snapshot lại (mục dưới). Dùng `trust_offset` để phát hiện sớm |
 | Không có slot | Slot bị drop | Engine tự tạo slot mới tại vị trí hiện tại → mất thay đổi ở giữa, không báo lỗi (đã kiểm chứng, xem [test](test-scenarios.md#replication-slot-bị-xoá)). Snapshot lại |
+
+### lsn_commit trễ một transaction
+
+Mỗi record mang `lsn_commit` của transaction **trước** nó, không phải của chính nó. Đã đọc bytecode
+`debezium-connector-postgres-3.5.2.Final` (`PostgresStreamingChangeEventSource`, `PostgresOffsetContext`):
+
+| Message từ Postgres | Debezium làm gì | Offset |
+|---|---|---|
+| INSERT / UPDATE / DELETE | `updateWalPosition` → cập nhật `lsn`, `lsn_proc`, **không** đụng `lsn_commit`; `dispatchDataChangeEvent` | Record mang offset lúc này → `lsn_commit` = commit txn trước |
+| COMMIT | `commitMessage` → `updateCommitPosition` (`lsn_commit` = commit txn này, chỉ trong bộ nhớ) → `dispatchHeartbeatEvent` | Chỉ ghi ra Kafka nếu heartbeat tạo record |
+
+Offset chỉ được ghi kèm record, nên commit LSN của txn cuối nằm trong bộ nhớ tới khi có record tiếp theo
+(thay đổi khác hoặc heartbeat).
+
+Ví dụ (heartbeat tắt):
+
+| Txn | Event LSN | Commit LSN | Offset được lưu |
+|---|---|---|---|
+| A | 90 | 100 | `lsn=90`, `lsn_commit=`(commit trước A) |
+| B | 150 | 160 | `lsn=150`, `lsn_commit=100` |
+| C | 200 | 210 | `lsn=200`, `lsn_commit=160` — `210` chỉ trong bộ nhớ |
+
+**Khi app dừng:** commit LSN của txn cuối (`210`) mất. Restart → nạp `lsn_commit=160`, record đầu tiên của phiên mới
+mang `160`. Không mất / trùng dữ liệu: event của C đã lên Kafka, `lsn_proc` đã lưu.
+
+| | `lsn_commit` của txn cuối bị mất khi |
+|---|---|
+| Heartbeat tắt | Luôn luôn, nếu sau nó không có thay đổi nào |
+| Heartbeat bật (10s) | App dừng trong ~10s sau COMMIT, cộng `offset.flush.interval.ms` (5s) → hở tối đa ~15s |
+
+**Restart bình thường (slot còn):** slot chỉ được flush tới `lsn_commit` đã lưu → Postgres gửi lại txn cuối,
+`WalPositionLocator` lọc theo `lsn_commit` + `lsn_proc` → không trùng event. Giá: slot giữ thêm ít WAL, decode lại 1 txn.
+Cũng vì slot không bao giờ được flush vượt `lsn_commit` đã lưu, `trust_offset` không báo động nhầm khi chạy bình thường.
+
+**Slot bị tạo lại:** slot mới nằm sau `lsn_commit` đã lưu → `trust_offset` fail. Đúng ý đồ: khoảng thay đổi ở giữa
+thật sự đã mất.
+
+**Kiểm chứng (2026-09-30, heartbeat tắt)**, tiếp theo test [Replication slot bị xoá](test-scenarios.md#replication-slot-bị-xoá):
+
+- Offset topic có 2 bản ghi liên tiếp cùng `lsn_commit = 283921496` (`0/10EC4C58`): record `slot-before` và record
+  UPDATE đầu tiên sau khi slot được tạo lại. Commit của `slot-before` không được lưu (không heartbeat), `slot-gap-*`
+  không được stream nên không có record.
+- Slot mới `confirmed_flush_lsn = 283928896` (`0/10EC6940`) > `lsn_commit`. Debezium flush `283921496` về slot, Postgres
+  bỏ qua vì slot không lùi.
+- `trust_slot` chỉ đổi vị trí bắt đầu stream (`PostgresReplicationConnection.shouldIgnoreExistingOffsetPosition`),
+  không ghi đè `lsn_commit` đã lưu.
+- Đổi sang `trust_offset` rồi restart → engine fail: không seek được slot về `283921496`, minimum là `283928896`.
 
 ### Restart khi offset đi trước slot
 
@@ -490,7 +537,7 @@ Property `offset.mismatch.strategy` (Debezium Postgres 3.5.2). Mô tả lấy t�
 | Giá trị | Hành vi | Đã thử |
 |---|---|---|
 | `no_validation` (mặc định) | Không so sánh với slot, stream từ offset đã lưu. Không phát hiện slot bị tạo lại | Offset < slot → **fail**, engine dừng |
-| `trust_offset` | Offset đi trước → advance slot tới offset. Slot đi trước → **fail** (để phát hiện slot bị tạo lại) | Chưa thử |
+| `trust_offset` | Offset đi trước → advance slot tới offset. Slot đi trước → **fail** (để phát hiện slot bị tạo lại) | Slot bị tạo lại → **fail** khi start, đúng như mô tả ([kiểm chứng](#lsn_commit-trễ-một-transaction)) |
 | `trust_slot` | Slot là chuẩn. Slot đi trước → nâng offset lên theo slot | Offset < slot → **chạy được** (đang dùng) |
 | `trust_greater_lsn` | Mô tả: đồng bộ về `max(offset_lsn, slot_lsn)`, tự hồi phục theo cả 2 chiều | Offset < slot → vẫn seek slot lùi về offset, Postgres từ chối, **retry mãi** |
 
